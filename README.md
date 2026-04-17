@@ -14,9 +14,9 @@ Note: Patching `libflutter.so` for TLS verification will not make the app proxy-
 
 ## Usage
 
-1. Extract the APK using apktool:
+1. Extract the APK using [`apktool`](https://github.com/ibotpeaches/apktool):
    ```sh
-   apktool d your_app.apk
+   apktool d --no-res --no-src your_app.apk
    ```
 2. Run the patch script:
    ```sh
@@ -26,7 +26,7 @@ Note: Patching `libflutter.so` for TLS verification will not make the app proxy-
    > There can be multiple `libflutter.so` files in the APK, so make sure to patch all of them if necessary (e.g., `your_app/lib/armeabi-v7a/libflutter.so`, `your_app/lib/arm64-v8a/libflutter.so`, etc.).
 3. Rebuild the APK using apktool:
    ```sh
-   apktool b your_app -o patched_app.apk
+   apktool b --net-sec-conf your_app -o patched_app.apk
    ```
 4. Sign the patched APK using your preferred signing tool.
    > I recommend using [APK Explorer & Editor (AEE)](https://github.com/apk-editor/APK-Explorer-Editor) for this step.
