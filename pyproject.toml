@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "patch-flutter-tls"
+version = "0.1.0"
+description = "Patch an APK to disable Flutter TLS verification by patching libflutter.so."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = ["keystone-engine>=0.9.2"]
+license = { text = "MIT" }
+authors = [{ name = "Aditya Telange" }]
+keywords = ["flutter", "tls", "apk", "patch", "android"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+[project.scripts]
+patch-flutter-tls = "patch_libflutter_tls:main"

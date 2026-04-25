@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-Patch a libflutter.so file to disable Flutter's ssl_verify_peer_cert function.
+Patch an APK to disable Flutter's ssl_verify_peer_cert function in bundled libflutter.so files.
 GitHub: https://github.com/adityatelange/patch-flutter-tls
 
 Usage:
-  python3 patch_libflutter_tls.py -i libflutter.so -o libflutter_patched.so
+  python3 patch_libflutter_tls.py app.apk
 
 Notes:
  - Supports x86 (i386) and x86_64 without additional dependencies.
  - For ARM/ARM64 payload assembly the script tries to use Keystone (keystone-engine).
    Install with: pip install keystone-engine
  - The script searches for the same patterns that the original Frida script used.
- - It patches every match found in the binary and writes a new file.
+ - It patches every match found in libflutter.so files inside the APK and writes a new APK.
 """
 
 import argparse
 import struct
 import sys
+import zipfile
 from pathlib import Path
 
 # Try to import Keystone for assembling ARM/ARM64/ARMv7/Thumb payloads.
@@ -129,6 +130,128 @@ def read_elf_machine(data):
     e_machine = struct.unpack_from('<H', data, 18)[0]
     return e_machine
 
+
+def clone_zip_info(zi):
+    """Create a clone of a ZipInfo object for repacking while preserving metadata."""
+    new_info = zipfile.ZipInfo(zi.filename, zi.date_time)
+    new_info.compress_type = zi.compress_type
+    new_info.comment = zi.comment
+    new_info.create_system = zi.create_system
+    new_info.create_version = zi.create_version
+    new_info.extract_version = zi.extract_version
+    new_info.flag_bits = zi.flag_bits
+    new_info.external_attr = zi.external_attr
+    new_info.internal_attr = zi.internal_attr
+    new_info.volume = zi.volume
+    new_info.compress_size = zi.compress_size
+    new_info.file_size = zi.file_size
+    return new_info
+
+
+def patch_data_bytes(data, force_arch=None, thumb=False, path=None):
+    """Patch a bytes object containing a libflutter.so ELF image."""
+    e_machine = read_elf_machine(data)
+    arch_key = None
+    if force_arch:
+        arch_key = force_arch
+        if path:
+            print("    [*] Forcing arch key %s for %s" % (arch_key, path))
+        else:
+            print("    [*] Forcing arch key: %s" % arch_key)
+    else:
+        if e_machine is None:
+            print("    [!] Input not recognized as ELF - defaulting to x64 patterns.")
+            arch_key = "x64"
+        else:
+            arch_key = EM_TO_ARCH.get(e_machine)
+            if arch_key is None:
+                print("    [!] Unknown ELF machine %d; defaulting to x64 patterns." % e_machine)
+                arch_key = "x64"
+            else:
+                if path:
+                    print("    [*] Detected architecture %s for %s" % (arch_key, path))
+                else:
+                    print("    [*] Detected architecture: %s (e_machine=%d)" % (arch_key, e_machine))
+
+    patterns = ANDROID_PATTERNS.get(arch_key)
+    if not patterns:
+        raise RuntimeError("No patterns available for arch %r" % arch_key)
+
+    patched = bytearray(data)
+    total_matches = 0
+    total_patches = 0
+    for pat in patterns:
+        vals, masks = parse_pattern(pat)
+        matches = find_all_matches(data, vals, masks)
+        if not matches:
+            continue
+        print("    [+] Pattern matched (%d hits) for pattern: %s" % (len(matches), pat))
+        for off in matches:
+            total_matches += 1
+            print("    [#] patching offset 0x%X" % off)
+            try:
+                stub = assemble_patch(arch_key, thumb=thumb)
+                total_patches += 1
+            except Exception as e:
+                print("    [!] Cannot assemble patch for arch %s: %s" % (arch_key, e))
+                print("    [!] Skipping this match.")
+                continue
+            target_len = len(vals)
+            write_len = len(stub)
+            if write_len > target_len:
+                print("    [!] Stub (%d bytes) larger than pattern match length (%d). Will overwrite %d bytes." %
+                      (write_len, target_len, write_len))
+                end = off + write_len
+                if end > len(patched):
+                    raise RuntimeError("Patch would overflow file size.")
+                patched[off:off+write_len] = stub
+            else:
+                patched[off:off+write_len] = stub
+                pad = target_len - write_len
+                if pad > 0:
+                    nop = arch_nop_bytes(arch_key)
+                    if arch_key in ("arm", "arm64"):
+                        if pad % 4 != 0:
+                            pad += (4 - (pad % 4))
+                    patched[off+write_len:off+write_len+pad] = nop * (pad // len(nop))
+    return bytes(patched), total_matches, total_patches
+
+
+def patch_apk(input_path: Path, output_path: Path):
+    print("[*] Patching APK: %s" % input_path)
+    total_matches = 0
+    patched_libs = 0
+    apk_libs = 0
+    entries = []
+    with zipfile.ZipFile(input_path, 'r') as zin:
+        for zi in zin.infolist():
+            data = zin.read(zi.filename)
+            if Path(zi.filename).name == "libflutter.so":
+                apk_libs += 1
+                print("  [*] Found libflutter.so in APK at %s" % zi.filename)
+                patched_data, matches, patches = patch_data_bytes(data, path=zi.filename)
+                if matches == 0:
+                    print("    [-] No patterns matched")
+                patched_libs += patches
+                total_matches += matches
+                data = patched_data
+            entries.append((zi, data))
+
+    if apk_libs == 0:
+        return apk_libs, patched_libs, total_matches
+
+    if patched_libs == 0:
+        return apk_libs, patched_libs, total_matches
+
+    with zipfile.ZipFile(output_path, 'w') as zout:
+        for zi, data in entries:
+            new_info = clone_zip_info(zi)
+            zout.writestr(new_info, data)
+
+    print("[+] Patched %d/%d libflutter.so files in APK." % (patched_libs, apk_libs))
+    return apk_libs, patched_libs, total_matches
+
+
 def assemble_patch(arch_key, thumb=False):
     """
     Prepare a small machine-code stub that returns 0 for the function, for each arch.
@@ -174,99 +297,39 @@ def arch_nop_bytes(arch_key):
         return b'\xd5\x03\x20\x1f'
     return b'\x00'
 
-def patch_file(input_path: Path, output_path: Path, force_arch=None, thumb=False):
-    data = input_path.read_bytes()
-    e_machine = read_elf_machine(data)
-    arch_key = None
-    if force_arch:
-        arch_key = force_arch
-        print("[*] Forcing arch key: %s" % arch_key)
-    else:
-        if e_machine is None:
-            print("[!] Input not recognized as ELF - defaulting to x64 patterns.")
-            arch_key = "x64"
-        else:
-            arch_key = EM_TO_ARCH.get(e_machine)
-            if arch_key is None:
-                print("[!] Unknown ELF machine %d; defaulting to x64 patterns." % e_machine)
-                arch_key = "x64"
-            else:
-                print("[*] Detected architecture: %s (e_machine=%d)" % (arch_key, e_machine))
+def print_banner():
+    print("patch-flutter-tls - Patch APK files to disable Flutter TLS verification in libflutter.so")
+    print("GitHub: https://github.com/adityatelange/patch-flutter-tls")
+    print()
 
-    patterns = ANDROID_PATTERNS.get(arch_key)
-    if not patterns:
-        raise RuntimeError("No patterns available for arch %r" % arch_key)
-
-    patched = bytearray(data)
-    total_matches = 0
-    for pat in patterns:
-        vals, masks = parse_pattern(pat)
-        matches = find_all_matches(data, vals, masks)
-        if not matches:
-            continue
-        print("[+] Pattern matched (%d hits) for pattern: %s" % (len(matches), pat))
-        for off in matches:
-            total_matches += 1
-            print("    - patching offset 0x%X" % off)
-            try:
-                stub = assemble_patch(arch_key, thumb=thumb)
-            except Exception as e:
-                print("    [!] Cannot assemble patch for arch %s: %s" % (arch_key, e))
-                print("    [!] Skipping this match.")
-                continue
-            # Overwrite at offset; preserve file length. Pad with NOPs if stub is shorter than pattern length.
-            target_len = len(vals)
-            write_len = len(stub)
-            if write_len > target_len:
-                # stub is larger than matched area; still write stub but warn (may overwrite more)
-                print("    [!] Stub (%d bytes) larger than pattern match length (%d). Will overwrite %d bytes." %
-                      (write_len, target_len, write_len))
-                # ensure we don't go beyond file end
-                end = off + write_len
-                if end > len(patched):
-                    raise RuntimeError("Patch would overflow file size.")
-                patched[off:off+write_len] = stub
-            else:
-                # write stub then pad rest with NOPs
-                patched[off:off+write_len] = stub
-                pad = target_len - write_len
-                if pad > 0:
-                    nop = arch_nop_bytes(arch_key)
-                    # repeat NOP to fill pad, respecting instruction size (for ARM make pad multiple of 4)
-                    if arch_key in ("arm", "arm64"):
-                        # round pad up to 4
-                        if pad % 4 != 0:
-                            pad += (4 - (pad % 4))
-                    patched[off+write_len:off+write_len+pad] = nop * (pad // len(nop))
-    if total_matches == 0:
-        print("[!] No matches were found. The output file will still be written but unchanged.")
-    output_path.write_bytes(bytes(patched))
-    print("[+] Wrote patched file to:", str(output_path))
-    print("[+] Total patched matches:", total_matches)
 
 def main():
-    ap = argparse.ArgumentParser(description="Patch libflutter.so to disable Flutter TLS verification.")
-    ap.add_argument("-i", "--input", required=True, help="Input .so file (libflutter.so)")
-    ap.add_argument("-o", "--output", required=False, help="Output patched .so file (default: <input>.patched.so)")
-    ap.add_argument("-u", "--inplace", action="store_true", help="Overwrite input file (write patched output to same path)")
-    ap.add_argument("--arch", required=False, choices=["x86", "x64", "arm", "arm64"], help="Force architecture (optional)")
-    ap.add_argument("--thumb", action="store_true", help="If patching ARM, assemble thumb variant (if using keystone)")
+    print_banner()
+    ap = argparse.ArgumentParser(description="Patch APK files to disable Flutter TLS verification.")
+    ap.add_argument("apk_path", help="Input APK file path")
     args = ap.parse_args()
 
-    inp = Path(args.input)
+    inp = Path(args.apk_path)
     if not inp.exists():
-        print("Input file not found:", args.input)
+        print("Input file not found:", inp)
         sys.exit(1)
-    if args.inplace and args.output:
-        print("Cannot use --inplace (-u) and --output (-o) together.")
+
+    if inp.suffix.lower() != ".apk":
+        print("Input file must be an APK: %s" % inp)
         sys.exit(1)
-    if args.inplace:
-        out = inp
-        print("[*] In-place update enabled; output will overwrite input file")
-    else:
-        out = Path(args.output) if args.output else inp.with_suffix(inp.suffix + ".patched.so")
+
+    out = inp.with_name(inp.stem + "_patched" + inp.suffix)
+
     try:
-        patch_file(inp, out, force_arch=args.arch, thumb=args.thumb)
+        libs, patches, matches = patch_apk(inp, out)
+        if not libs:
+            print("[!] No libflutter.so files found in APK.")
+        elif not matches:
+            print("[!] No matches were found.")
+        elif not patches:
+            print("[!] No patches were applied.")
+        else:
+            print("[+] Wrote patched APK to:", str(out))
     except Exception as e:
         print("[!] Error:", e)
         sys.exit(2)
