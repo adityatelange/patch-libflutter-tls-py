@@ -38,7 +38,13 @@ Also, the upstream Frida script is not compatible with Frida 17.x, so I decided 
 
    The script searches the APK for every `libflutter.so` (across all ABIs such as `arm64-v8a`, `armeabi-v7a`, `x86_64`, etc.), patches each match it finds, and writes an updated APK.
 
-2. Sign the patched APK using your preferred signing tool.
+2. Patch `network-security-config` to trust user-installed certificates.
+
+   Disabling Flutter TLS verification alone is often not enough for interception workflows.
+   You should also patch the app's `network-security-config` and allow `user` certificates.
+   I recommend using [patch-netsec-conf](https://github.com/adityatelange/patch-netsec-conf) for this step.
+
+3. Sign the patched APK using your preferred signing tool.
 
    > Any APK modification invalidates the original signature. You must re-sign before installing.
    > I recommend using [APK Explorer & Editor (AEE)](https://github.com/apk-editor/APK-Explorer-Editor) for this step.
