@@ -23,7 +23,7 @@ from pathlib import Path
 # Try to import Keystone for assembling ARM/ARM64/ARMv7/Thumb payloads.
 KS = None
 try:
-    from keystone import Ks, KS_ARCH_X86, KS_ARCH_ARM, KS_ARCH_ARM64, KS_MODE_32, KS_MODE_64, KS_MODE_LITTLE_ENDIAN, KS_MODE_ARM, KS_MODE_THUMB
+    from keystone import Ks, KS_ARCH_ARM, KS_ARCH_ARM64, KS_MODE_LITTLE_ENDIAN, KS_MODE_ARM, KS_MODE_THUMB
     KS = True
 except Exception:
     KS = False
@@ -182,6 +182,7 @@ def patch_data_bytes(data, force_arch=None, thumb=False, path=None):
         raise RuntimeError("No patterns available for arch %r" % arch_key)
 
     patched = bytearray(data)
+    patched_ranges = []  # (start, end) of every region already overwritten, across all patterns
     total_matches = 0
     total_patches = 0
     for pat, retval in patterns:
@@ -192,6 +193,10 @@ def patch_data_bytes(data, force_arch=None, thumb=False, path=None):
         print("    [+] Pattern matched (%d hits) for pattern: %s" % (len(matches), pat))
         for off in matches:
             total_matches += 1
+            match_end = off + len(vals)
+            if any(off < r_end and match_end > r_start for r_start, r_end in patched_ranges):
+                print("    [!] Match at offset 0x%X overlaps an already-patched region; skipping." % off)
+                continue
             print("    [#] patching offset 0x%X" % off)
             try:
                 # The arm32 pattern matches Thumb-2 code (Flutter's Android arm32 build),
@@ -212,9 +217,11 @@ def patch_data_bytes(data, force_arch=None, thumb=False, path=None):
                 if end > len(patched):
                     raise RuntimeError("Patch would overflow file size.")
                 patched[off:off+write_len] = stub
+                patched_ranges.append((off, end))
             else:
                 patched[off:off+write_len] = stub
                 pad = target_len - write_len
+                write_end = off + write_len
                 if pad > 0:
                     nop = arch_nop_bytes(arch_key, thumb=is_thumb)
                     align = 2 if is_thumb else 4
@@ -222,6 +229,8 @@ def patch_data_bytes(data, force_arch=None, thumb=False, path=None):
                         if pad % align != 0:
                             pad += (align - (pad % align))
                     patched[off+write_len:off+write_len+pad] = nop * (pad // len(nop))
+                    write_end = off + write_len + pad
+                patched_ranges.append((off, write_end))
     return bytes(patched), total_matches, total_patches
 
 
@@ -278,7 +287,7 @@ def assemble_patch(arch_key, retval=0, thumb=False):
     if arch_key == "arm":
         if not KS:
             raise RuntimeError("Keystone not available: ARM patching requires keystone-engine (pip install keystone-engine)")
-        # Use ARM or THUMB depending on 'thumb' flag
+        # Callers force thumb=True for arm32, since the matched patterns are Thumb-2 code.
         asm = "mov r0, #%d; bx lr" % retval
         ks = Ks(KS_ARCH_ARM, KS_MODE_ARM | KS_MODE_LITTLE_ENDIAN if not thumb else KS_MODE_THUMB | KS_MODE_LITTLE_ENDIAN)
         encoding, _ = ks.asm(asm)
