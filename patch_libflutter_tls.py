@@ -194,7 +194,10 @@ def patch_data_bytes(data, force_arch=None, thumb=False, path=None):
             total_matches += 1
             print("    [#] patching offset 0x%X" % off)
             try:
-                stub = assemble_patch(arch_key, retval=retval, thumb=thumb)
+                # The arm32 pattern matches Thumb-2 code (Flutter's Android arm32 build),
+                # so the replacement stub must be assembled as Thumb, not ARM.
+                is_thumb = thumb or arch_key == "arm"
+                stub = assemble_patch(arch_key, retval=retval, thumb=is_thumb)
                 total_patches += 1
             except Exception as e:
                 print("    [!] Cannot assemble patch for arch %s: %s" % (arch_key, e))
@@ -213,10 +216,11 @@ def patch_data_bytes(data, force_arch=None, thumb=False, path=None):
                 patched[off:off+write_len] = stub
                 pad = target_len - write_len
                 if pad > 0:
-                    nop = arch_nop_bytes(arch_key)
+                    nop = arch_nop_bytes(arch_key, thumb=is_thumb)
+                    align = 2 if is_thumb else 4
                     if arch_key in ("arm", "arm64"):
-                        if pad % 4 != 0:
-                            pad += (4 - (pad % 4))
+                        if pad % align != 0:
+                            pad += (align - (pad % align))
                     patched[off+write_len:off+write_len+pad] = nop * (pad // len(nop))
     return bytes(patched), total_matches, total_patches
 
@@ -289,13 +293,16 @@ def assemble_patch(arch_key, retval=0, thumb=False):
         return bytes(encoding)
     raise ValueError("Unsupported arch key: %r" % arch_key)
 
-def arch_nop_bytes(arch_key):
+def arch_nop_bytes(arch_key, thumb=False):
     """
     Return a NOP byte sequence for padding for the arch.
     """
     if arch_key == "x86" or arch_key == "x64":
         return b'\x90'
     if arch_key == "arm":
+        if thumb:
+            # Thumb NOP encoding: 0xBF00 -> little-endian bytes 00 BF
+            return b'\x00\xbf'
         # ARM NOP encoding: 0xE1A00000 -> little-endian bytes 00 00 A0 E1
         return b'\x00\x00\xa0\xe1'
     if arch_key == "arm64":
