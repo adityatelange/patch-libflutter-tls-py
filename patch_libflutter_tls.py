@@ -29,23 +29,27 @@ except Exception:
     KS = False
 
 # Patterns taken from https://github.com/NVISOsecurity/disable-flutter-tls-verification/blob/4ac95edba90cf48bb8298e6538b6f1e923926dc6/disable-flutter-tls.js#L26-L48
+# Each pattern is paired with the return value the patched stub should produce.
+# Most matches are ssl_verify_peer_cert (ssl_verify_result_t, 0 = ok), but one arm64
+# pattern matches ssl_crypto_x509_session_verify_cert_chain (bool, 1 = verified) instead,
+# so it needs retval=1.
 ANDROID_PATTERNS = {
     "arm64": [
-        "F? 0F 1C F8 F? 5? 01 A9 F? 5? 02 A9 F? ?? 03 A9 ?? ?? ?? ?? 68 1A 40 F9",
-        "F? 43 01 D1 FE 67 01 A9 F8 5F 02 A9 F6 57 03 A9 F4 4F 04 A9 13 00 40 F9 F4 03 00 AA 68 1A 40 F9",
-        "FF 43 01 D1 FE 67 01 A9 ?? ?? 06 94 ?? 7? 06 94 68 1A 40 F9 15 15 41 F9 B5 00 00 B4 B6 4A 40 F9",
-        "FF ?3 01 D1 F? ?? 01 A9 ?? ?? ?? 94 ?? ?? ?? 52 48 00 00 39 1A 50 40 F9 DA 02 00 B4 48 03 40 F9"
+        ("F? 0F 1C F8 F? 5? 01 A9 F? 5? 02 A9 F? ?? 03 A9 ?? ?? ?? ?? 68 1A 40 F9", 0),
+        ("F? 43 01 D1 FE 67 01 A9 F8 5F 02 A9 F6 57 03 A9 F4 4F 04 A9 13 00 40 F9 F4 03 00 AA 68 1A 40 F9", 0),
+        ("FF 43 01 D1 FE 67 01 A9 ?? ?? 06 94 ?? 7? 06 94 68 1A 40 F9 15 15 41 F9 B5 00 00 B4 B6 4A 40 F9", 0),
+        ("FF ?3 01 D1 F? ?? 01 A9 ?? ?? ?? 94 ?? ?? ?? 52 48 00 00 39 1A 50 40 F9 DA 02 00 B4 48 03 40 F9", 1),
     ],
     "arm": [
-        "2D E9 F? 4? D0 F8 00 80 81 46 D8 F8 18 00 D0 F8",
+        ("2D E9 F? 4? D0 F8 00 80 81 46 D8 F8 18 00 D0 F8", 0),
     ],
     "x64": [
-        "55 41 57 41 56 41 55 41 54 53 50 49 89 F? 4? 8B ?? 4? 8B 4? 30 4C 8B ?? ?? 0? 00 00 4D 85 ?? 74 1? 4D 8B",
-        "55 41 57 41 56 41 55 41 54 53 48 83 EC 18 49 89 FF 48 8B 1F 48 8B 43 30 4C 8B A0 28 02 00 00 4D 85 E4 74",
-        "55 41 57 41 56 41 55 41 54 53 48 83 EC 18 49 89 FE 4C 8B 27 49 8B 44 24 30 48 8B 98 D0 01 00 00 48 85 DB"
+        ("55 41 57 41 56 41 55 41 54 53 50 49 89 F? 4? 8B ?? 4? 8B 4? 30 4C 8B ?? ?? 0? 00 00 4D 85 ?? 74 1? 4D 8B", 0),
+        ("55 41 57 41 56 41 55 41 54 53 48 83 EC 18 49 89 FF 48 8B 1F 48 8B 43 30 4C 8B A0 28 02 00 00 4D 85 E4 74", 0),
+        ("55 41 57 41 56 41 55 41 54 53 48 83 EC 18 49 89 FE 4C 8B 27 49 8B 44 24 30 48 8B 98 D0 01 00 00 48 85 DB", 0),
     ],
     "x86": [
-        "55 89 E5 53 57 56 83 E4 F0 83 EC 20 E8 00 00 00 00 5B 81 C3 2B 79 66 00 8B 7D 08 8B 17 8B 42 18 8B 80 88 01"
+        ("55 89 E5 53 57 56 83 E4 F0 83 EC 20 E8 00 00 00 00 5B 81 C3 2B 79 66 00 8B 7D 08 8B 17 8B 42 18 8B 80 88 01", 0),
     ],
 }
 
@@ -180,7 +184,7 @@ def patch_data_bytes(data, force_arch=None, thumb=False, path=None):
     patched = bytearray(data)
     total_matches = 0
     total_patches = 0
-    for pat in patterns:
+    for pat, retval in patterns:
         vals, masks = parse_pattern(pat)
         matches = find_all_matches(data, vals, masks)
         if not matches:
@@ -190,7 +194,7 @@ def patch_data_bytes(data, force_arch=None, thumb=False, path=None):
             total_matches += 1
             print("    [#] patching offset 0x%X" % off)
             try:
-                stub = assemble_patch(arch_key, thumb=thumb)
+                stub = assemble_patch(arch_key, retval=retval, thumb=thumb)
                 total_patches += 1
             except Exception as e:
                 print("    [!] Cannot assemble patch for arch %s: %s" % (arch_key, e))
@@ -252,24 +256,26 @@ def patch_apk(input_path: Path, output_path: Path):
     return apk_libs, patched_libs, total_matches
 
 
-def assemble_patch(arch_key, thumb=False):
+def assemble_patch(arch_key, retval=0, thumb=False):
     """
-    Prepare a small machine-code stub that returns 0 for the function, for each arch.
+    Prepare a small machine-code stub that returns `retval` for the function, for each arch.
     Returns bytes of the stub.
     For ARM/ARM64 this uses Keystone if available.
     """
-    # x86 (32-bit): mov eax, 0; ret
+    # x86 (32-bit): mov eax, retval; ret
     if arch_key == "x86":
-        return b'\xB8\x00\x00\x00\x00\xC3'  # mov eax,0; ret
-    # x64: xor eax,eax; ret
+        return b'\xB8' + struct.pack('<I', retval) + b'\xC3'  # mov eax,retval; ret
+    # x64: mov eax, retval; ret
     if arch_key == "x64":
-        return b'\x31\xc0\xc3'  # xor eax,eax; ret
+        if retval == 0:
+            return b'\x31\xc0\xc3'  # xor eax,eax; ret
+        return b'\xB8' + struct.pack('<I', retval) + b'\xC3'  # mov eax,retval; ret
     # ARM32
     if arch_key == "arm":
         if not KS:
             raise RuntimeError("Keystone not available: ARM patching requires keystone-engine (pip install keystone-engine)")
         # Use ARM or THUMB depending on 'thumb' flag
-        asm = "mov r0, #0; bx lr" if not thumb else "mov r0, #0; bx lr"
+        asm = "mov r0, #%d; bx lr" % retval
         ks = Ks(KS_ARCH_ARM, KS_MODE_ARM | KS_MODE_LITTLE_ENDIAN if not thumb else KS_MODE_THUMB | KS_MODE_LITTLE_ENDIAN)
         encoding, _ = ks.asm(asm)
         return bytes(encoding)
@@ -277,7 +283,7 @@ def assemble_patch(arch_key, thumb=False):
     if arch_key == "arm64":
         if not KS:
             raise RuntimeError("Keystone not available: ARM64 patching requires keystone-engine (pip install keystone-engine)")
-        asm = "mov w0, #0; ret"
+        asm = "mov w0, #%d; ret" % retval
         ks = Ks(KS_ARCH_ARM64, KS_MODE_LITTLE_ENDIAN)
         encoding, _ = ks.asm(asm)
         return bytes(encoding)
